@@ -1,6 +1,7 @@
 
 import io
 import hashlib
+import re
 from datetime import datetime
 
 import numpy as np
@@ -13,7 +14,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 def normalize_colname(x: str) -> str:
     return str(x).strip().lower().replace(" ", "_").replace("-", "_").replace("/", "_")
@@ -72,19 +73,95 @@ def infer_mapping(df):
         "year": find_column(df, ["year", "annee", "année", "py"]),
     }
 
+
+def normalize_doi_value(x):
+    s = "" if pd.isna(x) else str(x).strip().lower()
+    s = re.sub(r"^https?://(dx\.)?doi\.org/", "", s)
+    s = re.sub(r"^doi:\s*", "", s)
+    return s
+
+def normalize_title_value(x):
+    s = "" if pd.isna(x) else str(x).lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def enrich_examples_from_main(example_df, main_df, main_map):
+    """
+    Match example records back to the main corpus using DOI first, then normalized title.
+    This ensures the model is trained on the real title + abstract + keywords from the
+    1,426-record corpus instead of short notes in the example files.
+    """
+    if example_df is None or example_df.empty:
+        return pd.DataFrame(), 0
+
+    emap = infer_mapping(example_df)
+    main = main_df.copy()
+
+    main["_doi_key"] = safe_text_series(main, main_map["doi"]).map(normalize_doi_value)
+    main["_title_key"] = safe_text_series(main, main_map["title"]).map(normalize_title_value)
+
+    doi_lookup = {}
+    title_lookup = {}
+    for idx, row in main.iterrows():
+        d = row["_doi_key"]
+        t = row["_title_key"]
+        if d and d not in doi_lookup:
+            doi_lookup[d] = idx
+        if t and t not in title_lookup:
+            title_lookup[t] = idx
+
+    matched_rows = []
+    for _, erow in example_df.iterrows():
+        edoi = normalize_doi_value(erow[emap["doi"]]) if emap["doi"] else ""
+        etitle = normalize_title_value(erow[emap["title"]]) if emap["title"] else ""
+        midx = None
+
+        if edoi and edoi in doi_lookup:
+            midx = doi_lookup[edoi]
+        elif etitle and etitle in title_lookup:
+            midx = title_lookup[etitle]
+
+        if midx is not None:
+            matched_rows.append(main.loc[midx])
+
+    if not matched_rows:
+        return pd.DataFrame(), 0
+
+    matched = pd.DataFrame(matched_rows).reset_index(drop=True)
+    return matched, len(matched)
+
 def make_training_from_examples(positive_df, negative_df):
     chunks = []
+    main_df = st.session_state.main_df
+    main_map = st.session_state.mapping
 
     def prep(df, label):
         if df is None or df.empty:
-            return None
-        m = infer_mapping(df)
-        text = compose_text(df, m["title"], m["abstract"], m["keywords"])
-        out = pd.DataFrame({"text": text, "label": label})
-        return out[out["text"].str.len() > 10]
+            return None, 0
 
-    p = prep(positive_df, 1)
-    n = prep(negative_df, 0)
+        matched, matched_n = enrich_examples_from_main(
+            df, main_df, main_map
+        )
+
+        # If some examples cannot be matched, fall back to their own text,
+        # but matched corpus text is preferred.
+        if matched_n > 0:
+            text = compose_text(
+                matched,
+                main_map["title"],
+                main_map["abstract"],
+                main_map["keywords"]
+            )
+            out = pd.DataFrame({"text": text, "label": label})
+        else:
+            m = infer_mapping(df)
+            text = compose_text(df, m["title"], m["abstract"], m["keywords"])
+            out = pd.DataFrame({"text": text, "label": label})
+
+        return out[out["text"].str.len() > 10], matched_n
+
+    p, p_matched = prep(positive_df, 1)
+    n, n_matched = prep(negative_df, 0)
 
     if p is not None:
         chunks.append(p)
@@ -100,6 +177,11 @@ def make_training_from_examples(positive_df, negative_df):
                 decided[["text_for_model", "label"]]
                 .rename(columns={"text_for_model": "text"})
             )
+
+    st.session_state.example_match_stats = {
+        "positive_matched": int(p_matched),
+        "negative_matched": int(n_matched)
+    }
 
     if not chunks:
         return pd.DataFrame(columns=["text", "label"])
@@ -289,6 +371,15 @@ with tab2:
         m2.metric("Not relevant examples", n_count)
         m3.metric("Total training records", len(train_df))
 
+        match_stats = st.session_state.get("example_match_stats", {})
+        if match_stats:
+            st.info(
+                f"Matched back to the main corpus: "
+                f"{match_stats.get('positive_matched', 0)} relevant examples and "
+                f"{match_stats.get('negative_matched', 0)} not relevant examples. "
+                f"The model is trained on the real title + abstract + keywords from the main dataset."
+            )
+
         st.caption(
             "Provide clear examples from both classes. "
             "Training cannot start if one class is missing."
@@ -315,6 +406,7 @@ with tab2:
                     ("clf", LogisticRegression(
                         max_iter=2000,
                         class_weight="balanced",
+                        C=4.0,
                         random_state=42
                     ))
                 ])
@@ -350,6 +442,13 @@ with tab2:
                 st.session_state.model = pipe
                 st.session_state.metrics = metrics
                 st.session_state.screening_df = scored
+                st.session_state.score_diagnostics = {
+                    "min": float(scored["model_probability"].min()),
+                    "q10": float(scored["model_probability"].quantile(0.10)),
+                    "median": float(scored["model_probability"].median()),
+                    "q90": float(scored["model_probability"].quantile(0.90)),
+                    "max": float(scored["model_probability"].max()),
+                }
                 st.success("Model trained successfully and dataset scored.")
 
         if "metrics" in st.session_state and st.session_state.metrics:
@@ -365,8 +464,23 @@ with tab3:
     ):
         st.warning("Train the model in Tab 2 first.")
     else:
-        low_threshold = st.slider("LOW relevance threshold", 0.0, 0.5, 0.25, 0.01)
-        high_threshold = st.slider("HIGH relevance threshold", 0.5, 1.0, 0.80, 0.01)
+        low_threshold = st.slider("LOW relevance threshold", 0.0, 0.5, 0.35, 0.01)
+        high_threshold = st.slider("HIGH relevance threshold", 0.5, 1.0, 0.65, 0.01)
+
+        diagnostics = st.session_state.get("score_diagnostics")
+        if diagnostics:
+            st.caption(
+                "Score distribution — "
+                f"min: {diagnostics['min']:.2f} | "
+                f"10th pct: {diagnostics['q10']:.2f} | "
+                f"median: {diagnostics['median']:.2f} | "
+                f"90th pct: {diagnostics['q90']:.2f} | "
+                f"max: {diagnostics['max']:.2f}"
+            )
+            st.warning(
+                "Thresholds are for prioritization, not automatic academic exclusion. "
+                "Do not adjust them merely to force a predetermined number of included studies."
+            )
 
         if low_threshold >= high_threshold:
             st.error("The LOW threshold must be lower than the HIGH threshold.")
@@ -516,7 +630,7 @@ with tab4:
             "n_exclude_human": int((df["human_decision"] == "EXCLUDE").sum()),
             "n_uncertain_human": int((df["human_decision"] == "UNCERTAIN").sum()),
             "random_state": 42,
-            "model": "TF-IDF + LogisticRegression(class_weight='balanced')"
+            "model": "TF-IDF + LogisticRegression(class_weight='balanced', C=4.0)"
         }])
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
